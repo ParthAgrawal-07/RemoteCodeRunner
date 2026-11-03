@@ -1,216 +1,102 @@
-# Remote Code Runner — Console-Based OS Project
+# Remote Code Runner (enhanced)
 
-> **Type:** Console-Based Client-Server Application  
-> **Language:** C (POSIX / Linux)
-
----
-
-## Project Overview
-
-This project implements a **Remote Code Execution System** — a client-server application where a client sends source code (C or Python) over a TCP socket to a server, which compiles and/or executes it in a sandboxed subprocess and returns the output back to the client.
-
-The system demonstrates core OS and systems programming concepts including:
-- TCP socket programming
-- Multi-threaded server design with POSIX threads
-- Process creation and management using `fork()` / `exec()`
-- Inter-process communication using pipes
-- Resource limiting with `setrlimit()`
-- Signal handling (`SIGCHLD`, `SIGALRM`)
-- Thread-safe logging with mutex locks
-
----
-
-## Architecture
+A multi-threaded TCP server written in C that receives **C or Python** source code from
+a client, runs it under resource limits in an isolated child process, and returns the
+output and how the program ended.
 
 ```
-┌─────────────┐       TCP Socket (Port 9000)      ┌──────────────────────────────┐
-│             │  ──── lang + code ──────────────►  │                              │
-│   client.c  │                                    │   server.c  (main loop)      │
-│  (Client)   │  ◄─── output ───────────────────   │   + executor.c (fork/exec)   │
-│             │                                    │   + logger.c  (log thread)   │
-└─────────────┘                                    └──────────────────────────────┘
+ client ──TCP──► server: accept ─► thread ─► execute_code ─► fork ─► [uid nobody, rlimits, own process group]
+                                                                         gcc ─► ./prog     |   python3 main.py
+        ◄────── RESULT <STATE> <code> <n>\n<n bytes of output>  ◄─── pipe (stdout+stderr), per-request deadline
 ```
 
-The server spawns a new **POSIX thread** per client connection. Each thread calls the executor, which `fork()`s a child process to run the code and streams output back through a pipe.
+## Build, run, test
 
----
+```bash
+make                         # builds ./server and ./client (needs gcc, python3 on the server)
+./server [port] [max_clients] [read_timeout_sec]   # defaults: 9000, 8, 10
+./client 127.0.0.1                                  # interactive; finish the code with a line "."
+./client 127.0.0.1 -l Python -f hello.py            # from a file
+./client 192.168.1.10 -p 9000 -l C -f prog.c -t 30  # remote server, 30 s result timeout
 
-## File Structure
-
-```
-.
-├── server.h       # Shared header: macros, includes, function declarations
-├── server.c       # TCP server — accepts connections, spawns threads per client
-├── client.c       # TCP client — sends language + code, prints output
-├── executor.c     # Code execution engine — fork/exec with sandboxing
-└── logger.c       # Thread-safe file logger
+make test                    # 47 regression tests
+make asan && make test       # same tests under AddressSanitizer + UBSan
 ```
 
----
+Run the server as **root** (or in a container) to get full isolation: each job then runs as
+`nobody` with a process-count limit and, where the kernel allows, no network. As a normal
+user it still works ("dev mode") but jobs share your uid.
 
-## File Descriptions
+Client exit status: `0` program exited 0 · `1` program failed / request rejected · `2` connection or protocol error.
 
-### `server.h` — Shared Header
-Defines constants and declares shared symbols used across all modules:
-- `PORT 9000` — the TCP port the server listens on
-- `BUFFER_SIZE 8192` — max code/output buffer size
-- `execute_code()` and `log_event()` function declarations
-- `log_mutex` extern declaration for thread-safe logging
+## Protocol
 
----
+TCP is a byte stream — it preserves order, **not message boundaries** — so every message carries its length.
 
-### `server.c` — TCP Server
-The entry point of the server application.
-
-**Responsibilities:**
-- Creates a TCP socket and binds it to `PORT 9000`
-- Listens for incoming client connections (backlog: 16)
-- Accepts connections in an infinite loop
-- Spawns a detached POSIX thread (`pthread_create` + `pthread_detach`) for each client
-- Each thread receives the language identifier and source code from the client, calls `execute_code()`, and sends the output back
-
-**Key OS Concepts Used:**
-- `socket()`, `bind()`, `listen()`, `accept()` — BSD socket API
-- `pthread_create()` / `pthread_detach()` — POSIX threads
-- `SIGCHLD` handler with `waitpid(..., WNOHANG)` to reap zombie child processes
-- `SO_REUSEADDR` socket option to allow quick server restarts
-
----
-
-### `client.c` — TCP Client
-The console-based client that the user interacts with.
-
-**Responsibilities:**
-- Connects to the server at a given IP (default: `172.20.10.4`) and port `9000`
-- Prompts the user to enter a language (`C` or `Python`)
-- Reads multi-line source code from stdin (terminated by an empty line)
-- Sends language and code to the server over the socket
-- Receives and prints the execution output
-
-**Usage:**
 ```
-./client [server_ip]
-```
-If no IP is provided, it defaults to `172.20.10.4`.
-
-**Input Flow:**
-```
-Enter Language (C/Python): Python
-Enter code. End by entering an empty line:
-print("Hello from remote!")
-
---- Execution Output ---
-Hello from remote!
---- End ---
+Request   RUN <lang> <nbytes>\n<nbytes of source>
+Response  RESULT <STATE> <code> <nbytes>\n<nbytes of output>      or      ERR <REASON>\n
 ```
 
----
+| STATE | meaning | code |
+|---|---|---|
+| `EXITED` | ran to completion | exit status |
+| `SIGNALED` | killed by a signal (e.g. 11 = SIGSEGV, 24 = CPU limit) | signal number |
+| `TIMEOUT` | wall-clock limit (5 s) | 0 |
+| `OUTPUT_LIMIT` | more than 64 KB of output | 0 |
+| `COMPILE_ERROR` | compiler failed (output = compiler messages) | compiler status |
+| `UNSUPPORTED` / `INTERNAL` | unknown language / server fault | 0 |
 
-### `executor.c` — Code Execution Engine
-The core of the project. Handles safe, sandboxed execution of submitted code.
+`ERR` reasons: `BAD_REQUEST`, `TOO_LARGE` (> 64 KB), `INCOMPLETE` (client stalled).
 
-**Responsibilities:**
-- Writes the received source code to a unique temp file (`/tmp/codeXXXXXX.c` or `.py`) using `mkstemps()`
-- `fork()`s a child process to compile (for C) and/or run the code
-- Redirects child's `stdout` and `stderr` to a pipe for output capture
-- Reads output from the pipe and returns it as a dynamically allocated string
-- Kills the child and cleans up temp files after execution
+## Files
 
-**Sandbox / Safety Features:**
-
-| Feature | Implementation |
+| File | Responsibility |
 |---|---|
-| CPU time limit | `setrlimit(RLIMIT_CPU, 3s)` |
-| Memory limit | `setrlimit(RLIMIT_AS, 64 MB)` |
-| Execution timeout | `alarm()` + `SIGALRM` handler kills child via `SIGKILL` |
-| Temp file isolation | `mkstemps()` creates unique files; `unlink()` removes them after use |
-| Output capture | `dup2()` redirects child stdout/stderr into a pipe |
+| `protocol.[ch]` | Shared framing: `send_all`, `recv_all`, `recv_line` (EINTR-safe, total-time deadlines, `MSG_NOSIGNAL`), result states |
+| `server.c` | Accept loop, semaphore-bounded thread per connection, request parsing, graceful shutdown |
+| `executor.c` | Per-job directory, compile + run stages, rlimits, privilege drop, process-group kill, cleanup |
+| `logger.c` | Thread-safe logger; sanitises client-controlled text |
+| `client.c` | CLI client (`getopt`, file or interactive input, exit codes) |
+| `tests/test_all.py` | 47 regression tests, each aimed at a specific bug or security property |
 
-**C Execution Flow:**
-1. Write code to `/tmp/codeXXXXXX.c`
-2. Compile: `gcc <src> -o /tmp/exe_<pid>`
-3. Run: `<exe_path>`
-4. Both compile errors and runtime output are captured together
+## What was wrong in v1, and how it is fixed
 
-**Python Execution Flow:**
-1. Write code to `/tmp/codeXXXXXX.py`
-2. Run: `python3 <src_path>`
+Every row was reproduced against v1 before being fixed, and has a regression test.
 
----
+| # | v1 problem | Fix |
+|---|---|---|
+| 1 | Timeout used a **global `child_pid` and `alarm()`/`SIGALRM`**, which are per-*process*. With two concurrent requests the second overwrote the first's PID and timer, so the first was never killed (a 9 s program ran to completion). | No signals at all. Each request `poll()`s its own pipe against its own deadline using only local variables. |
+| 2 | **No message framing**: two bare `recv()` calls assumed one-`send()`-one-`recv()`. Back-to-back sends hung the server thread; programs larger than one TCP segment could be truncated. | Length-prefixed protocol; `recv_all()` loops until exactly *n* bytes arrive; header line is read byte-wise so the payload is never over-read. |
+| 3 | A **`SIGCHLD` handler doing `waitpid(-1)`** could reap the child that another thread's `waitpid(pid)` was waiting for, leaving `status` uninitialised (a crash was reported as "no output"). | No handler. Each thread reaps exactly its own child; `status` is always initialised. |
+| 4 | **Temp files leaked** on early-return paths (and `mkstemps` was implicitly declared, an error on GCC 14+). | One `mkdtemp` directory per job, removed on every path (`goto cleanup`). |
+| 5 | **Killing only the direct child** left grandchildren alive; the child **inherited every server fd** (listening socket, other clients' sockets); no limit on forks, disk, or output; code ran as the server's user; `bash -c` shell string. | Own process group + `kill(-pgid, SIGKILL)`; all fds are `CLOEXEC`; `RLIMIT_NPROC/FSIZE/NOFILE/CORE`; output cap; drop to `nobody`; `NO_NEW_PRIVS`; best-effort network namespace; minimal environment; no shell (`execve` with an argv array). |
+| 6 | **Idle clients held threads forever.** With a bounded pool this is a trivial denial of service. | Whole-request read deadline (default 10 s) enforced with `poll`, so trickling bytes does not help either. |
+| 7 | A client disconnecting at the wrong moment could raise **SIGPIPE** and kill the process. | `MSG_NOSIGNAL` on every send, plus `SIGPIPE` ignored. |
+| 8 | Log injection via client-supplied text; `localtime()` not thread-safe; log file opened/closed per line. | Control characters neutralised; `localtime_r`; file opened once with `O_CLOEXEC`. |
+| 9 | Python output buffered in the pipe was lost when the job was killed. | `python3 -u` (unbuffered), so partial output survives a timeout. |
+| 10 | Client: hard-coded IP, blank lines could not appear in code, single `recv()` for the reply, leaks on error paths. | `getopt` options, `.` terminator, framed reply, single cleanup path (found by LeakSanitizer). |
 
-### `logger.c` — Thread-Safe Logger
-Provides timestamped event logging to `logs/run.log`.
+Smaller design points: compile and run are separate stages with separate limits (gcc needs far more than the 128 MB / 3 s given to a user program); the fork–exec child uses only async-signal-safe calls, since `fork()` in a multithreaded process only duplicates the calling thread; adding a language is one row in a table.
 
-**Responsibilities:**
-- Implements `log_event(fmt, ...)` — a variadic logging function
-- Uses `pthread_mutex_lock` / `pthread_mutex_unlock` to prevent concurrent write corruption
-- Appends log entries with timestamp in `YYYY-MM-DD HH:MM:SS` format
-- Automatically creates the `logs/` directory on server startup (via `mkdir()` in `server.c`)
+## Security model — read this before exposing it anywhere
 
-**Sample Log Output:**
-```
-[2026-03-30 18:45:01] Server started on port 9000
-[2026-03-30 18:45:10] Accepted connection from 192.168.1.5:54321 fd=4
-[2026-03-30 18:45:10] Received request (fd=4) lang=Python size=28
-[2026-03-30 18:45:11] Closed connection fd=4
-```
+This is **resource limiting plus basic isolation, not a hardened sandbox.**
 
----
+What it does: bounded CPU / wall time / memory / output / disk / processes, a separate uid, a clean environment, no inherited descriptors, whole-process-tree termination, per-job scratch directory, optional network namespace.
 
-## How to Build and Run
+What it does **not** do (all are the next steps for production):
 
-### Prerequisites
-- GCC compiler
-- Python 3 installed on the server machine
-- POSIX-compliant Linux system
-- `pthread` library
+- **Filesystem is not isolated.** Jobs can read any world-readable file on the host. Next: `chroot`/`pivot_root` + mount namespace, or run each job in a container.
+- **No syscall filtering.** Next: seccomp-bpf allow-list.
+- **Network isolation needs root and a permissive kernel** (the startup log says whether it is available).
+- **`RLIMIT_NPROC` is per-uid, shared by concurrent jobs**, and is only applied when running as root.
+- **`RLIMIT_AS` limits address space, not resident memory.** Next: cgroups v2 (`memory.max`, `pids.max`, `cpu.max`).
+- No authentication, no TLS, no rate limiting per client.
+- C programs that are killed lose unflushed stdio buffers (Python is unbuffered).
 
-### Compilation
+For real untrusted code: containers or microVMs (gVisor, Firecracker) with cgroups and seccomp.
 
-```bash
-# Compile the server
-gcc server.c executor.c logger.c -o server -lpthread
+## Adding a language
 
-# Compile the client
-gcc client.c -o client
-```
-
-### Running
-
-**Start the server (on host machine):**
-```bash
-./server
-```
-Output: `[Server] Listening on port 9000`
-
-**Run the client (on same or different machine):**
-```bash
-./client <server_ip>
-# Example:
-./client 172.20.10.4
-```
-
----
-
-## Concepts Demonstrated
-
-| Concept | Where Used |
-|---|---|
-| TCP Socket Programming | `server.c`, `client.c` |
-| Multi-threading (pthreads) | `server.c` — one thread per client |
-| Process Creation (`fork`) | `executor.c` |
-| `exec` family (`execlp`) | `executor.c` — runs gcc / python3 |
-| Pipes (IPC) | `executor.c` — capturing child output |
-| Signal Handling | `server.c` (SIGCHLD), `executor.c` (SIGALRM) |
-| Resource Limits (`setrlimit`) | `executor.c` — CPU & memory caps |
-| Mutex Locks | `logger.c` — thread-safe logging |
-| File I/O (temp files) | `executor.c` — mkstemps, unlink |
-
----
-
-## Limitations & Notes
-
-- The client sends language and code in **two separate `send()` calls** — on fast loopback networks this works fine, but on slower/lossy links a framing protocol (e.g., length-prefixed messages) would be more robust.
-- The server default IP in `client.c` (`172.20.10.4`) is hardcoded for the project setup — pass the correct server IP as a command-line argument when running on a different machine.
-- Only **C** and **Python** are supported. Other language strings return `"Unsupported language."`.
-- The system uses `bash -c "gcc ... && ./exe"` for C, so `bash` must be present on the server.
+Add one row to `LANGS[]` in `executor.c` (source file name, optional compile argv, run argv) — nothing else changes.
